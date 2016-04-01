@@ -190,6 +190,7 @@ int __read_mostly futex_cmpxchg_enabled;
 #endif
 #define FLAGS_CLOCKRT		0x02
 #define FLAGS_HAS_TIMEOUT	0x04
+#define FLAGS_ATTACHED		0x08
 
 /*
  * Priority Inheritance state:
@@ -263,6 +264,23 @@ struct futex_hash_bucket {
 	struct plist_head chain;
 } ____cacheline_aligned_in_smp;
 
+struct futex_state {
+	struct futex_hash_bucket	hb;
+	struct futex_q			q;
+	struct futex_hash_bucket	*global_hb;
+	atomic_t			users;
+	struct rcu_head			rcu;
+};
+
+struct futex_cache_slot {
+	u32 __user		*uaddr;
+	struct futex_state	*fs;
+};
+
+struct futex_cache_rcu {
+	struct rcu_head         rcu;
+	struct futex_cache_slot	slots[];
+};
 /*
  * The base of the bucket array and its size are always used together
  * (after initialization only in hash_futex()), so ensure that they
@@ -411,22 +429,6 @@ static inline void hb_remove_q(struct futex_q *q, struct futex_hash_bucket *hb)
 }
 
 /**
- * hash_futex - Return the hash bucket in the global hash
- * @key:	Pointer to the futex key for which the hash is calculated
- *
- * We hash on the keys returned from get_futex_key (see below) and return the
- * corresponding hash bucket in the global hash.
- */
-static struct futex_hash_bucket *hash_futex(union futex_key *key)
-{
-	u32 hash = jhash2((u32*)&key->both.word,
-			  (sizeof(key->both.word)+sizeof(key->both.ptr))/4,
-			  key->both.offset);
-	return &futex_queues[hash & (futex_hashsize - 1)];
-}
-
-
-/**
  * match_futex - Check whether to futex keys are equal
  * @key1:	Pointer to key1
  * @key2:	Pointer to key2
@@ -438,21 +440,213 @@ static inline int match_futex(union futex_key *key1, union futex_key *key2)
 	return (key1 && key2
 		&& key1->both.word == key2->both.word
 		&& key1->both.ptr == key2->both.ptr
-		&& key1->both.offset == key2->both.offset);
+		&& key1->both.offset == key2->both.offset
+		&& key1->both.attached == key2->both.attached);
+}
+
+/**
+ * hash_global_futex - Return the hash bucket in the global hash
+ * @key:	Pointer to the futex key for which the hash is calculated
+ *
+ * We hash on the keys returned from get_futex_key (see below) and return the
+ * corresponding hash bucket in the global hash.
+ */
+static struct futex_hash_bucket *hash_global_futex(union futex_key *key)
+{
+	u32 hash = jhash2((u32*)&key->both.word,
+			  (sizeof(key->both.word)+sizeof(key->both.ptr))/4,
+			  key->both.offset);
+	return &futex_queues[hash & (futex_hashsize - 1)];
+}
+
+/**
+ * hash_futex - Get the hash bucket for a futex
+ *
+ * Returns either the local or the global hash bucket which fits the key.
+ *
+ * In case of an attached futex, we already verified that the hash and the
+ * slot exists, so we can unconditionally dereference it.
+ */
+static struct futex_hash_bucket *hash_futex(union futex_key *key)
+{
+	struct futex_cache *tc;
+	struct futex_hash_bucket *hb = NULL;
+	struct futex_state *fs;
+
+	if (!key->both.attached)
+		return hash_global_futex(key);
+
+	tc = &current->mm->futex_cache;
+
+	rcu_read_lock();
+	fs = rcu_dereference(tc->slots[key->both.slot].fs);
+	if (!fs)
+		goto out;
+
+	if (!atomic_inc_not_zero(&fs->users))
+		goto out;
+
+	/* It has been long time since we first matched index to uaddr. Let's
+	 * see if it did change in the meantime. Technically it wouldn't matter
+	 * if the user did an attach+detach while this operation was in progress
+	 * and its slot got reused: it is still a valid futex. However it might
+	 * ease debugging if this did not happen on purpose but by mistake.
+	 */
+	if (match_futex(key, &fs->q.key))
+		hb = &fs->hb;
+	else
+		atomic_dec(&fs->users);
+out:
+	rcu_read_unlock();
+	return hb;
+}
+
+static void futex_private_ret_hb(struct futex_hash_bucket *hb,
+				union futex_key *key)
+{
+	struct futex_cache *tc;
+	struct futex_state *fs;
+
+	if (!hb)
+		return;
+	if (key->both.attached == false)
+		return;
+
+	tc = &current->mm->futex_cache;
+	fs = container_of(hb, struct futex_state, hb);
+
+	atomic_dec(&fs->users);
+}
+
+static void futex_fs_cleanup(struct rcu_head *head)
+{
+	struct futex_state *fs = container_of(head, struct futex_state, rcu);
+
+	kfree(fs);
+}
+
+/**
+ * futex_detach_task - Detach task from global state
+ * @slot:	Slot number in the task local cache
+ *
+ * If the global state refcount drops to zero, the global state is destroyed.
+ */
+static int futex_detach_task(struct futex_cache *tc, int slot)
+{
+	struct futex_state *fs;
+	struct futex_hash_bucket *hb;
+	struct futex_q *q;
+
+	/* Remove it from the task local cache */
+	raw_spin_lock(&tc->cache_lock);
+	fs = tc->slots[slot].fs;
+	if (!fs) {
+		raw_spin_unlock(&tc->cache_lock);
+		return -EINVAL;
+	}
+
+	if (!atomic_dec_and_test(&fs->users)) {
+		atomic_inc(&fs->users);
+		raw_spin_unlock(&tc->cache_lock);
+		return -EBUSY;
+	}
+	tc->slots[slot].uaddr = NULL;
+	rcu_assign_pointer(tc->slots[slot].fs, NULL);
+	clear_bit(slot, tc->cache_map);
+
+	raw_spin_unlock(&tc->cache_lock);
+
+	hb = fs->global_hb;
+	q = &fs->q;
+
+	/*
+	 * Once removed from global state, the same uaddr can be attached again.
+	 */
+	spin_lock(&hb->lock);
+	hb_remove_q(q, hb);
+	spin_unlock(&hb->lock);
+	/*
+	 * XXX
+	 * force grace_period if there are too much pending fs cleanups
+	 * synchronize_rcu();
+	 */
+	call_rcu(&fs->rcu, futex_fs_cleanup);
+	return 0;
+}
+
+/**
+ * futex_attach_task - Attach current to a global state
+ * @fs:		Pointer to global state
+ * @uaddr:	User space address of the futex
+ * @slot:	Hash slot to reference @fs in current
+ *
+ * Take a refcount on the global state and store the pointer to it in the
+ * given @slot of the current tasks futex cache along with @uaddr. Mark the
+ * slot as occupied.
+ *
+ * Must be called with fs->global_hb->lock held
+ */
+static void futex_attach_task(struct futex_state *fs, u32 __user *uaddr,
+			      int slot, struct futex_cache *tc)
+{
+	raw_spin_lock(&tc->cache_lock);
+	rcu_assign_pointer(tc->slots[slot].fs, fs);
+	tc->slots[slot].uaddr = uaddr;
+	raw_spin_unlock(&tc->cache_lock);
+}
+
+/**
+ * futex_queue_state - Queue a futex state object in the global hash
+ * @fs:		Pointer to the futex state object
+ * @hb:		Pointer to the hash bucket
+ *
+ * Must be called with hb->lock held
+ */
+static void
+futex_queue_state(struct futex_state *fs, struct futex_hash_bucket *hb)
+{
+	int prio = NICE_TO_PRIO(MIN_NICE);
+
+	fs->global_hb = hb;
+	fs->q.lock_ptr = &hb->lock;
+	hb_insert_q(&fs->q, hb, prio);
 }
 
 /**
  * futex_key_init - Initialize a futex key
  * @key:	Pointer to the key to initialize
- * @uaddr:	User space address of the futex
- * @flags:	Flags to check for futex mode. Not yet used
+ * @uaddr:	User space address of the futex or cookie in attached mode
+ * @flags:	Flags to check for attached mode
  *
- * Returns:	@uaddr
+ * Returns:
+ *	@uaddr in non attached mode
+ *	The stored uaddr in attached mode or NULL, if cookie is invalid
  */
 static u32 __user *futex_key_init(union futex_key *key, u32 __user *uaddr,
 				  unsigned int flags)
 {
+	struct futex_cache *tc = &current->mm->futex_cache;
+	unsigned long slot;
+
 	*key = FUTEX_KEY_INIT;
+	if (!(flags & FLAGS_ATTACHED))
+		return uaddr;
+
+	slot = (unsigned long)uaddr;
+	if (slot >= tc->cache_size)
+		return NULL;
+
+	/*
+	 * We established that the slot is available, but we avoid the
+	 * hash_map scan for the slot because uaddr is NULL if the slot is not
+	 * occupied. Caller must check for NULL anyway, so we can simply
+	 * return slot.uaddr.
+	 */
+	key->both.attached = true;
+	key->both.slot = slot;
+	rcu_read_lock();
+	uaddr = tc->slots[slot].uaddr;
+	rcu_read_unlock();
 	return uaddr;
 }
 
@@ -520,29 +714,10 @@ static void drop_futex_key_refs(union futex_key *key)
 	}
 }
 
-/**
- * get_futex_key() - Get parameters which are the keys for a futex
- * @uaddr:	virtual address of the futex
- * @fshared:	0 for a PROCESS_PRIVATE futex, 1 for PROCESS_SHARED
- * @key:	address where result is stored.
- * @rw:		mapping needs to be read/write (values: VERIFY_READ,
- *              VERIFY_WRITE)
- *
- * Return: a negative error code or 0
- *
- * The key words are stored in *key on success.
- *
- * For shared mappings, it's (page->index, file_inode(vma->vm_file),
- * offset_within_page).  For private mappings, it's (uaddr, current->mm).
- * We can usually work out the index without swapping in the page.
- *
- * lock_page() might sleep, the caller should not hold a spinlock.
- */
-static int
-get_futex_key(u32 __user *uaddr, int fshared, union futex_key *key, int rw)
+static int __get_futex_key(u32 __user *uaddr, int fshared, union futex_key *key,
+			   int rw, struct mm_struct *mm)
 {
 	unsigned long address = (unsigned long)uaddr;
-	struct mm_struct *mm = current->mm;
 	struct page *page, *tail;
 	struct address_space *mapping;
 	int err, ro = 0;
@@ -745,6 +920,30 @@ out:
 	return err;
 }
 
+/**
+ * get_futex_key() - Get parameters which are the keys for a futex
+ * @uaddr:	virtual address of the futex
+ * @fshared:	0 for a PROCESS_PRIVATE futex, 1 for PROCESS_SHARED
+ * @key:	address where result is stored.
+ * @rw:		mapping needs to be read/write (values: VERIFY_READ,
+ *              VERIFY_WRITE)
+ *
+ * Return: a negative error code or 0
+ *
+ * The key words are stored in *key on success.
+ *
+ * For shared mappings, it's (page->index, file_inode(vma->vm_file),
+ * offset_within_page).  For private mappings, it's (uaddr, current->mm).
+ * We can usually work out the index without swapping in the page.
+ *
+ * lock_page() might sleep, the caller should not hold a spinlock.
+ */
+static int
+get_futex_key(u32 __user *uaddr, int fshared, union futex_key *key, int rw)
+{
+	return __get_futex_key(uaddr, fshared, key, rw, current->mm);
+}
+
 static inline void put_futex_key(union futex_key *key)
 {
 	drop_futex_key_refs(key);
@@ -938,6 +1137,17 @@ void exit_pi_state_list(struct task_struct *curr)
 		pi_state = list_entry(next, struct futex_pi_state, list);
 		key = pi_state->key;
 		hb = hash_futex(&key);
+		if (WARN_ON_ONCE(!hb)) {
+			/*
+			 * This is something that should have not happen. Remove
+			 * that entry from list so we don't spin here forever
+			 * without holding the hb lock since we can't find it.
+			 * No wake ups.
+			 */
+			list_del_init(&pi_state->list);
+			pi_state->owner = NULL;
+			continue;
+		}
 		raw_spin_unlock_irq(&curr->pi_lock);
 
 		spin_lock(&hb->lock);
@@ -949,6 +1159,7 @@ void exit_pi_state_list(struct task_struct *curr)
 		 */
 		if (head->next != next) {
 			spin_unlock(&hb->lock);
+			futex_private_ret_hb(hb, &key);
 			continue;
 		}
 
@@ -961,6 +1172,7 @@ void exit_pi_state_list(struct task_struct *curr)
 		rt_mutex_unlock(&pi_state->pi_mutex);
 
 		spin_unlock(&hb->lock);
+		futex_private_ret_hb(hb, &key);
 
 		raw_spin_lock_irq(&curr->pi_lock);
 	}
@@ -1482,6 +1694,10 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 		goto out;
 
 	hb = hash_futex(&key);
+	if (!hb) {
+		ret = -EINVAL;
+		goto out_put_key;
+	}
 
 	/* Make sure we really have tasks to wakeup */
 	if (!hb_waiters_pending(hb))
@@ -1510,6 +1726,7 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	wake_up_q(&wake_q);
 out_put_key:
 	put_futex_key(&key);
+	futex_private_ret_hb(hb, &key);
 out:
 	return ret;
 }
@@ -1546,6 +1763,8 @@ retry:
 
 	hb1 = hash_futex(&key1);
 	hb2 = hash_futex(&key2);
+	if (!hb1 || !hb2)
+		goto out_put_keys;
 
 retry_private:
 	double_lock_hb(hb1, hb2);
@@ -1574,6 +1793,9 @@ retry_private:
 
 		if (!(flags & FLAGS_SHARED))
 			goto retry_private;
+
+		futex_private_ret_hb(hb1, &key1);
+		futex_private_ret_hb(hb2, &key2);
 
 		put_futex_key(&key2);
 		put_futex_key(&key1);
@@ -1612,6 +1834,8 @@ out_unlock:
 	double_unlock_hb(hb1, hb2);
 	wake_up_q(&wake_q);
 out_put_keys:
+	futex_private_ret_hb(hb1, &key1);
+	futex_private_ret_hb(hb2, &key2);
 	put_futex_key(&key2);
 out_put_key1:
 	put_futex_key(&key1);
@@ -1831,6 +2055,8 @@ retry:
 
 	hb1 = hash_futex(&key1);
 	hb2 = hash_futex(&key2);
+	if (!hb1 || !hb2)
+		goto out_ret_hb;
 
 retry_private:
 	hb_waiters_inc(hb2);
@@ -1847,11 +2073,13 @@ retry_private:
 
 			ret = get_user(curval, uaddr1);
 			if (ret)
-				goto out_put_keys;
+				goto out_ret_hb;
 
 			if (!(flags & FLAGS_SHARED))
 				goto retry_private;
 
+			futex_private_ret_hb(hb1, &key1);
+			futex_private_ret_hb(hb2, &key2);
 			put_futex_key(&key2);
 			put_futex_key(&key1);
 			goto retry;
@@ -1909,6 +2137,8 @@ retry_private:
 		case -EFAULT:
 			double_unlock_hb(hb1, hb2);
 			hb_waiters_dec(hb2);
+			futex_private_ret_hb(hb1, &key1);
+			futex_private_ret_hb(hb2, &key2);
 			put_futex_key(&key2);
 			put_futex_key(&key1);
 			ret = fault_in_user_writeable(uaddr2);
@@ -1924,6 +2154,8 @@ retry_private:
 			 */
 			double_unlock_hb(hb1, hb2);
 			hb_waiters_dec(hb2);
+			futex_private_ret_hb(hb1, &key1);
+			futex_private_ret_hb(hb2, &key2);
 			put_futex_key(&key2);
 			put_futex_key(&key1);
 			cond_resched();
@@ -2040,6 +2272,9 @@ out_unlock:
 	while (--drop_count >= 0)
 		drop_futex_key_refs(&key1);
 
+out_ret_hb:
+	futex_private_ret_hb(hb1, &key1);
+	futex_private_ret_hb(hb2, &key2);
 out_put_keys:
 	put_futex_key(&key2);
 out_put_key1:
@@ -2055,7 +2290,8 @@ static inline struct futex_hash_bucket *queue_lock(struct futex_q *q)
 	struct futex_hash_bucket *hb;
 
 	hb = hash_futex(&q->key);
-
+	if (!hb)
+		return NULL;
 	/*
 	 * Increment the counter before taking the lock so that
 	 * a potential waker won't miss a to-be-slept task that is
@@ -2122,7 +2358,7 @@ static inline void queue_me(struct futex_q *q, struct futex_hash_bucket *hb)
  *   1 - if the futex_q was still queued (and we removed unqueued it);
  *   0 - if the futex_q was already removed by the waking thread
  */
-static int unqueue_me(struct futex_q *q)
+static int unqueue_me(struct futex_q *q, struct futex_hash_bucket *hb)
 {
 	spinlock_t *lock_ptr;
 	int ret = 0;
@@ -2161,7 +2397,7 @@ retry:
 		spin_unlock(lock_ptr);
 		ret = 1;
 	}
-
+	futex_private_ret_hb(hb, &q->key);
 	drop_futex_key_refs(&q->key);
 	return ret;
 }
@@ -2442,11 +2678,16 @@ retry:
 
 retry_private:
 	*hb = queue_lock(q);
+	if (!*hb) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	ret = get_futex_value_locked(&uval, uaddr);
 
 	if (ret) {
 		queue_unlock(*hb);
+		futex_private_ret_hb(*hb, &q->key);
 
 		ret = get_user(uval, uaddr);
 		if (ret)
@@ -2461,6 +2702,7 @@ retry_private:
 
 	if (uval != val) {
 		queue_unlock(*hb);
+		futex_private_ret_hb(*hb, &q->key);
 		ret = -EWOULDBLOCK;
 	}
 
@@ -2514,7 +2756,7 @@ retry:
 	/* If we were woken (and unqueued), we succeeded, whatever. */
 	ret = 0;
 	/* unqueue_me() drops q.key ref */
-	if (!unqueue_me(&q))
+	if (!unqueue_me(&q, hb))
 		goto out;
 	ret = -ETIMEDOUT;
 	if (to && !to->task)
@@ -2605,6 +2847,10 @@ retry:
 
 retry_private:
 	hb = queue_lock(&q);
+	if (!hb) {
+		ret = -EINVAL;
+		goto out_put_key;
+	}
 
 	ret = futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current, 0);
 	if (unlikely(ret)) {
@@ -2627,6 +2873,7 @@ retry_private:
 			 * - The user space value changed.
 			 */
 			queue_unlock(hb);
+			futex_private_ret_hb(hb, &q.key);
 			put_futex_key(&q.key);
 			cond_resched();
 			goto retry;
@@ -2674,11 +2921,13 @@ retry_private:
 
 	/* Unqueue and drop the lock */
 	unqueue_me_pi(&q);
+	futex_private_ret_hb(hb, &q.key);
 
 	goto out_put_key;
 
 out_unlock_put_key:
 	queue_unlock(hb);
+	futex_private_ret_hb(hb, &q.key);
 
 out_put_key:
 	put_futex_key(&q.key);
@@ -2689,6 +2938,7 @@ out:
 
 uaddr_faulted:
 	queue_unlock(hb);
+	futex_private_ret_hb(hb, &q.key);
 
 	ret = fault_in_user_writeable(uaddr);
 	if (ret)
@@ -2731,6 +2981,10 @@ retry:
 		return ret;
 
 	hb = hash_futex(&key);
+	if (!hb) {
+		ret = -EINVAL;
+		goto out_putkey;
+	}
 	spin_lock(&hb->lock);
 
 	/*
@@ -2759,6 +3013,7 @@ retry:
 		 */
 		if (ret == -EAGAIN) {
 			spin_unlock(&hb->lock);
+			futex_private_ret_hb(hb, &key);
 			put_futex_key(&key);
 			goto retry;
 		}
@@ -2787,11 +3042,13 @@ retry:
 out_unlock:
 	spin_unlock(&hb->lock);
 out_putkey:
+	futex_private_ret_hb(hb, &key);
 	put_futex_key(&key);
 	return ret;
 
 pi_faulted:
 	spin_unlock(&hb->lock);
+	futex_private_ret_hb(hb, &key);
 	put_futex_key(&key);
 
 	ret = fault_in_user_writeable(uaddr);
@@ -3042,6 +3299,7 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
 	}
 
 out_put_keys:
+	futex_private_ret_hb(hb, &q.key);
 	put_futex_key(&q.key);
 out_key2:
 	put_futex_key(&key2);
@@ -3274,6 +3532,373 @@ void exit_robust_list(struct task_struct *curr)
 				   curr, pip);
 }
 
+static void futex_cache_rcu_cb(struct rcu_head *head)
+{
+	struct futex_cache_rcu *cache_rcu;
+
+	cache_rcu = container_of(head, struct futex_cache_rcu, rcu);
+	kfree(cache_rcu);
+}
+
+/**
+ * futex_get_task_cache_slot - Get a slot in the tasks local cache
+ *
+ * If the cache is not yet available it's allocated. If the existing cache is
+ * too small the cache is extended.
+ *
+ * Returns a valid slot or an error code
+ */
+static int futex_get_task_cache_slot(struct futex_cache *tc)
+{
+	struct futex_cache_rcu *cache_rcu;
+	struct futex_cache_slot *slots;
+	int slot, cache_size = TASK_CACHE_INCR;
+	size_t size;
+	unsigned int old_cache_size;
+
+	old_cache_size = 0;
+
+start_over:
+	rcu_read_lock();
+	if (rcu_dereference(tc->slots)) {
+		old_cache_size = READ_ONCE(tc->cache_size);
+		/* Find a free slot in the existing cache */
+		slot = find_first_zero_bit(tc->cache_map, old_cache_size);
+		if (slot < old_cache_size) {
+			if (!test_and_set_bit(slot, tc->cache_map)) {
+				rcu_read_unlock();
+				return slot;
+			}
+			rcu_read_unlock();
+			goto start_over;
+		}
+		/* Increment the cache size by TASK_CACHE_INCR */
+		cache_size += old_cache_size + TASK_CACHE_INCR;
+
+		/* Task exceeds cache size? */
+		if (cache_size > TASK_CACHE_MAX_SIZE) {
+			rcu_read_unlock();
+			return -ENOSPC;
+		}
+	}
+	rcu_read_unlock();
+
+	/* Allocate a new task cache */
+	size = sizeof(*cache_rcu) + cache_size * sizeof(struct futex_cache_slot);
+	cache_rcu = kzalloc_node(size, GFP_KERNEL, numa_node_id());
+	if (!cache_rcu)
+		return -ENOMEM;
+
+	raw_spin_lock(&tc->cache_lock);
+	/* another concurrent resize? */
+	if (old_cache_size != tc->cache_size) {
+		raw_spin_unlock(&tc->cache_lock);
+		kfree(cache_rcu);
+		goto start_over;
+	}
+
+	slots = tc->slots;
+	/* Copy existing data, if we extend the cache */
+	if (slots) {
+		/* Only copy the old size */
+		memcpy(&cache_rcu->slots[0], slots,
+		       old_cache_size * sizeof(struct futex_cache_slot));
+	}
+	rcu_assign_pointer(tc->slots, &cache_rcu->slots[0]);
+	/* Populate it and return the first available slot */
+	tc->cache_size = cache_size;
+	raw_spin_unlock(&tc->cache_lock);
+
+	if (slots) {
+		cache_rcu = container_of(slots, struct futex_cache_rcu, slots[0]);
+		call_rcu(&cache_rcu->rcu, futex_cache_rcu_cb);
+	}
+	goto start_over;
+}
+
+/**
+ * futex_create - Create an attached futex object
+ * @uaddr:	The user space address of the futex
+ * @key:	Pointer to a initialized futex key object
+ * @hb:		Pointer to the hash bucket in the global hash corresponding
+ *		to @key
+ * @slot:	Free task cache slot number
+ *
+ * Returns:
+ *  Success:	Slot number >= 0 which is used as a cookie for
+ *		all further operations on that futex
+ *  Failure:	Proper error code
+ *		ENOMEM: Out of memory
+ *		EEXIST: Global state exists already
+ */
+static int futex_create(u32 __user *uaddr, union futex_key *key,
+			struct futex_hash_bucket *hb, struct futex_cache *tc,
+			int slot)
+{
+	struct futex_state *fs;
+	struct futex_q *match;
+
+	fs = kzalloc_node(sizeof(*fs), GFP_KERNEL, numa_node_id());
+	if (!fs)
+		return -ENOMEM;
+
+	atomic_set(&fs->users, 1);
+	atomic_set(&fs->hb.waiters, 0);
+	plist_head_init(&fs->hb.chain);
+	spin_lock_init(&fs->hb.lock);
+
+	fs->q = futex_q_init;
+	/* This is the global state object. Set an invalid slot */
+	fs->q.key = *key;
+	fs->q.key.both.slot = ~0U;
+
+	/* Verify again whether global state for this futex exists already */
+	spin_lock(&hb->lock);
+	match = futex_top_waiter(hb, &fs->q.key);
+	if (match) {
+		spin_unlock(&hb->lock);
+		kfree(fs);
+		return -EEXIST;
+	}
+	/*
+	 * Queue the new global state in the global hash and attach the task
+	 * to it.
+	 */
+	futex_queue_state(fs, hb);
+	futex_attach_task(fs, uaddr, slot, tc);
+	spin_unlock(&hb->lock);
+	return 0;
+}
+
+/**
+ * futex_attach - Attach a task to a registered futex
+ * @uaddr:	The user space address of the futex
+ *
+ * Returns:
+ *  Success:	Slot number >= 0 which is used as a cookie for
+ *		all further operations on that futex
+ *  Failure:	Proper error code
+ *		ENOMEM: Out of memory
+ *		EINVAL: Invalid @uaddr
+ *		EFAULT: @uaddr access would fault
+ *		ENOSPC: TASK_CACHE_MAX_SIZE reached, no free slots
+ *
+ * Note: We do not check whether the futex has been attached already as this
+ * would involve a walk through the slots. There is no damage except a little
+ * bit memory usage by this task.
+ */
+static int futex_attach(u32 __user *uaddr)
+{
+	union futex_key key = FUTEX_KEY_INIT;
+	struct futex_hash_bucket *hb;
+	struct futex_cache *tc;
+	struct futex_q *match;
+	int ret, slot;
+
+	ret = get_futex_key(uaddr, 0 , &key, VERIFY_WRITE);
+	if (ret)
+		return ret;
+
+	tc = &current->mm->futex_cache;
+	/* Get a slot in the task local cache */
+	slot = futex_get_task_cache_slot(tc);
+	if (slot < 0) {
+		ret = slot;
+		goto out_put_key;
+	}
+
+	/* Find the global state and attach to it */
+	key.both.attached = true;
+	hb = hash_global_futex(&key);
+
+	spin_lock(&hb->lock);
+	match = futex_top_waiter(hb, &key);
+	spin_unlock(&hb->lock);
+	if (match) {
+		ret = -EEXIST;
+		goto out_clr_slot;
+	}
+	ret = futex_create(uaddr, &key, hb, tc, slot);
+	if (ret < 0)
+		goto out_clr_slot;
+	ret = slot;
+
+out_put_key:
+	put_futex_key(&key);
+	return ret;
+
+out_clr_slot:
+	clear_bit(slot, current->mm->futex_cache.cache_map);
+	goto out_put_key;
+}
+
+/**
+ * futex_detach - Detach a task from a registered futex
+ * @uaddr:	The cookie which was returned from attach
+ *
+ * Returns:
+ *  Success:	0
+ *  Failure:	Proper error code
+ *		EINVAL: Invalid @flags or invalid @uaddr
+ */
+static int futex_detach(u32 __user *uaddr)
+{
+	struct futex_cache *tc = &current->mm->futex_cache;
+	union futex_key key;
+
+	/* We look up the slot and verify that it is populated */
+	uaddr = futex_key_init(&key, uaddr, FLAGS_ATTACHED);
+	if (!uaddr)
+		return -EINVAL;
+
+	return futex_detach_task(tc, key.both.slot);
+}
+
+void futex_mm_init(struct mm_struct *mm)
+{
+	memset(&mm->futex_cache, 0, sizeof(struct futex_cache));
+	raw_spin_lock_init(&mm->futex_cache.cache_lock);
+}
+
+/**
+ * futex_mm_dup_cache - duplicate cache of attached futexes
+ * @mm:			new mm to fill
+ * @oldmm:		old mm to fill from
+ *
+ */
+int futex_mm_dup_cache(struct mm_struct *mm, struct mm_struct *oldmm)
+{
+	struct futex_cache *old_tc		= &oldmm->futex_cache;
+	struct futex_cache *tc			= &mm->futex_cache;
+	struct futex_cache_slot *old_slots;
+	struct futex_cache_rcu *cache_rcu;
+	struct futex_state *fs;
+	unsigned int size;
+	unsigned int slot;
+	unsigned long *map;
+	int ret;
+
+	/*
+	 * This is sad. We need to populate new ->futex_cache cache struct
+	 * based on current entries. We can't re-use old futex_state objects
+	 * because mm_struct has changed so we need to hash the uaddr again
+	 * attach it properly. It is possible that the user will exec() and we
+	 * didn't need this at all.
+	 * Due to RCU the fs / slots pointer can't vanish but might be replaced
+	 * while we here because of other threads which are busy.
+	 * If there is a race between ATTACH+DETACH and this fork() then the
+	 * SLOT we drop / miss was not valid during the fork() operation so it
+	 * is not bad if we miss it.
+	 */
+	if (!old_tc->slots)
+		return 0;
+	map = old_tc->cache_map;
+	size = old_tc->cache_size;
+	cache_rcu = kzalloc_node(sizeof(*cache_rcu) + size *
+				 sizeof(struct futex_cache_slot),
+				 GFP_KERNEL, numa_node_id());
+	if (!cache_rcu)
+		return -ENOMEM;
+
+	tc->slots = &cache_rcu->slots[0];
+	tc->cache_size = size;
+	raw_spin_lock_init(&tc->cache_lock);
+
+	rcu_read_lock();
+	old_slots = rcu_dereference(old_tc->slots);
+
+	slot = find_first_bit(map, size);
+	for (; slot < size; slot = find_next_bit(map, size, slot)) {
+		union futex_key key = FUTEX_KEY_INIT;
+		struct futex_hash_bucket *hb;
+		u32 __user *uaddr;
+
+		fs = rcu_dereference(old_slots[slot].fs);
+		if (!fs) {
+			slot++;
+			continue;
+		}
+		if (!atomic_read(&fs->users)) {
+			slot++;
+			continue;
+		}
+
+		uaddr = READ_ONCE(old_slots[slot].uaddr);
+		rcu_read_unlock();
+		if (!uaddr) {
+			slot++;
+			rcu_read_lock();
+			old_slots = rcu_dereference(old_tc->slots);
+			continue;
+		}
+		ret = __get_futex_key(uaddr, 0, &key, VERIFY_WRITE, mm);
+		if (ret)
+			goto err;
+
+		key.both.attached = true;
+		hb = hash_global_futex(&key);
+		ret = futex_create(uaddr, &key, hb, tc, slot);
+		if (ret) {
+			put_futex_key(&key);
+			goto err;
+		}
+
+		rcu_read_lock();
+		old_slots = rcu_dereference(old_tc->slots);
+
+		/*
+		 * We can't increment the refcount because that would mean that
+		 * a detach might fail due to a fork() in progress (but why copy
+		 * something that is going to be removed anyway?).
+		 */
+		if (fs != rcu_dereference(old_slots[slot].fs) ||
+		    !atomic_read(&fs->users) ||
+		    READ_ONCE(old_slots[slot].uaddr) != uaddr) {
+			futex_detach_task(tc, slot);
+		}
+		put_futex_key(&key);
+
+		set_bit(slot, tc->cache_map);
+		slot++;
+	}
+	rcu_read_unlock();
+	return 0;
+err:
+	exit_futex_mm_cache(mm);
+	return ret;
+}
+
+void exit_futex_mm_cache(struct mm_struct *mm)
+{
+	struct futex_cache *tc = &mm->futex_cache;
+	struct futex_cache_slot *slots = tc->slots;
+	struct futex_state *fs;
+	unsigned int slot, size;
+	unsigned long *map;
+
+	map = tc->cache_map;
+	size = tc->cache_size;
+	slot = find_first_bit(map, size);
+
+	for (; slot < size; slot = find_next_bit(map, size, slot)) {
+		struct futex_hash_bucket *hb;
+		/*
+		 * Everything left here is because the user did not detach it.
+		 * RCU isn't used for free them because there are no users left.
+		 */
+		fs = slots[slot].fs;
+		hb = fs->global_hb;
+
+		spin_lock(&hb->lock);
+		hb_remove_q(&fs->q, hb);
+		spin_unlock(&hb->lock);
+		kfree(fs);
+		slot++;
+	}
+	if (slots)
+		kfree(container_of(slots, struct futex_cache_rcu, slots[0]));
+}
+
 long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		u32 __user *uaddr2, u32 val2, u32 val3)
 {
@@ -3288,6 +3913,12 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		if (cmd != FUTEX_WAIT && cmd != FUTEX_WAIT_BITSET && \
 		    cmd != FUTEX_WAIT_REQUEUE_PI)
 			return -ENOSYS;
+	}
+
+	if (op & FUTEX_ATTACHED) {
+		if (flags & FLAGS_SHARED)
+			return -EINVAL;
+		flags |= FLAGS_ATTACHED;
 	}
 
 	switch (cmd) {
@@ -3327,6 +3958,10 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 					     uaddr2);
 	case FUTEX_CMP_REQUEUE_PI:
 		return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
+	case FUTEX_ATTACH:
+		return futex_attach(uaddr);
+	case FUTEX_DETACH:
+		return futex_detach(uaddr);
 	}
 	return -ENOSYS;
 }

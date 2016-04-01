@@ -127,6 +127,7 @@ struct sched_attr {
 };
 
 struct futex_pi_state;
+struct futex_cache;
 struct robust_list_head;
 struct bio_list;
 struct fs_struct;
