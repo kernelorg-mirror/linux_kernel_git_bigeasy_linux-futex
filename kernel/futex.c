@@ -3172,7 +3172,8 @@ retry:
 		 * PI futexes happens in exit_pi_state():
 		 */
 		if (!pi && (uval & FUTEX_WAITERS))
-			futex_wake(uaddr, 1, 1, FUTEX_BITSET_MATCH_ANY);
+			futex_wake(uaddr, FLAGS_SHARED, 1,
+				   FUTEX_BITSET_MATCH_ANY);
 	}
 	return 0;
 }
