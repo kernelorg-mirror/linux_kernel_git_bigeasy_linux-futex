@@ -75,6 +75,7 @@ static inline void exit_pi_state_list(struct task_struct *curr) { }
 
 extern unsigned int futex_default_hash_bits;
 extern unsigned int futex_max_hash_bits;
+extern unsigned int futex_sysmax_hash_bits;
 
 extern void futex_mm_hash_exit(struct mm_struct *mm);
 

@@ -307,6 +307,7 @@ struct futex_hash_bucket {
 
 unsigned int futex_default_hash_bits			= FUTEX_DEF_HASH_BITS;
 unsigned int futex_max_hash_bits			= FUTEX_MAX_HASH_BITS;
+unsigned int  __read_mostly futex_sysmax_hash_bits	= FUTEX_MAX_HASH_BITS;
 #else
 static const unsigned int futex_default_hash_bits = 0;
 #endif

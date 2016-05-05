@@ -31,6 +31,8 @@ show up in /proc/sys/kernel:
 - ctrl-alt-del
 - dmesg_restrict
 - domainname
+- futex_private_default_hash_bits
+- futex_private_max_hash_bits
 - hostname
 - hotplug
 - hardlockup_all_cpu_backtrace
@@ -300,6 +302,22 @@ domain names are in general different. For a detailed discussion
 see the hostname(1) man page.
 
 ==============================================================
+
+futex_private_default_hash_bits:
+
+Adjusts the default hash size (in bits) which is used for
+automatic hash allocations on the first futex operation
+
+==============================================================
+
+futex_private_max_hash_bits:
+
+Adjusts the maximum hash size (in bits). This limits the hash
+size which can be preallocated by applications with the
+FUTEX_PREALLOC_HASH op.
+
+==============================================================
+
 hardlockup_all_cpu_backtrace:
 
 This value controls the hard lockup detector behavior when a hard
