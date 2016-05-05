@@ -25,6 +25,12 @@
 
 #include <err.h>
 #include <sys/time.h>
+#ifdef CONFIG_NUMA
+#include <numa.h>
+#endif
+
+#define FUTEX_ATTACH	13
+#define FUTEX_ATTACHED	512
 
 static unsigned int nthreads = 0;
 static unsigned int nsecs    = 10;
@@ -32,6 +38,7 @@ static unsigned int nsecs    = 10;
 static unsigned int nfutexes = 1024;
 static bool fshared = false, done = false, silent = false;
 static int futex_flag = 0;
+static int numa_node = -1;
 
 struct timeval start, end, runtime;
 static pthread_mutex_t thread_lock;
@@ -42,9 +49,10 @@ static pthread_cond_t thread_parent, thread_worker;
 struct worker {
 	int tid;
 	u_int32_t *futex;
+	u_int32_t *futex_id;
 	pthread_t thread;
 	unsigned long ops;
-};
+} __attribute__((aligned(128)));
 
 static const struct option options[] = {
 	OPT_UINTEGER('t', "threads", &nthreads, "Specify amount of threads"),
@@ -52,8 +60,27 @@ static const struct option options[] = {
 	OPT_UINTEGER('f', "futexes", &nfutexes, "Specify amount of futexes per threads"),
 	OPT_BOOLEAN( 's', "silent",  &silent,   "Silent mode: do not display data/details"),
 	OPT_BOOLEAN( 'S', "shared",  &fshared,  "Use shared futexes instead of private ones"),
+#ifdef CONFIG_NUMA
+	OPT_INTEGER( 'n', "numa",   &numa_node,  "Specify the NUMA node"),
+#endif
 	OPT_END()
 };
+
+#ifndef CONFIG_NUMA
+static int numa_run_on_node(int node __maybe_unused) { return 0; }
+static int numa_node_of_cpu(int node __maybe_unused) { return 0; }
+static void *numa_alloc_local(size_t size) { return malloc(size); }
+static void numa_free(void *p, size_t size __maybe_unused) { return free(p); }
+#endif
+
+static bool cpu_is_local(int cpu)
+{
+	if (numa_node < 0)
+		return true;
+	if (numa_node_of_cpu(cpu) == numa_node)
+		return true;
+	return false;
+}
 
 static const char * const bench_futex_hash_usage[] = {
 	"perf bench futex hash <options>",
@@ -81,7 +108,8 @@ static void *workerfn(void *arg)
 			 * such as internal waitqueue handling, thus enlarging
 			 * the critical region protected by hb->lock.
 			 */
-			ret = futex_wait(&w->futex[i], 1234, NULL, futex_flag);
+			ret = futex_wait((void *)(unsigned long)w->futex_id[i],
+					 1234, NULL, futex_flag);
 			if (!silent &&
 			    (!ret || errno != EAGAIN || errno != EWOULDBLOCK))
 				warn("Non-expected futex return call");
@@ -111,6 +139,11 @@ static void print_summary(void)
 	       (int) runtime.tv_sec);
 }
 
+static int futex_attach(u_int32_t *uaddr, unsigned int opflags)
+{
+	return futex(uaddr, FUTEX_ATTACH, 0, 0, NULL, 0, opflags);
+}
+
 int bench_futex_hash(int argc, const char **argv,
 		     const char *prefix __maybe_unused)
 {
@@ -120,6 +153,8 @@ int bench_futex_hash(int argc, const char **argv,
 	unsigned int i, ncpus;
 	pthread_attr_t thread_attr;
 	struct worker *worker = NULL;
+	char *node_str = NULL;
+	unsigned int cpunum;
 
 	argc = parse_options(argc, argv, options, bench_futex_hash_usage, 0);
 	if (argc) {
@@ -133,18 +168,50 @@ int bench_futex_hash(int argc, const char **argv,
 	act.sa_sigaction = toggle_done;
 	sigaction(SIGINT, &act, NULL);
 
-	if (!nthreads) /* default to the number of CPUs */
-		nthreads = ncpus;
+	if (!nthreads) {
+		/* default to the number of CPUs per NUMA node */
+		if (numa_node < 0) {
+			nthreads = ncpus;
+		} else {
+			for (i = 0; i < ncpus; i++) {
+				if (cpu_is_local(i))
+					nthreads++;
+			}
+			if (!nthreads)
+				err(EXIT_FAILURE, "No online CPUs for this node");
+		}
+	} else {
+		int cpu_available = 0;
 
-	worker = calloc(nthreads, sizeof(*worker));
+		for (i = 0; i < ncpus && !cpu_available; i++) {
+			if (cpu_is_local(i))
+				cpu_available = 1;
+		}
+		if (!cpu_available)
+			err(EXIT_FAILURE, "No online CPUs for this node");
+	}
+
+	if (numa_node >= 0) {
+		ret = numa_run_on_node(numa_node);
+		if (ret < 0)
+			err(EXIT_FAILURE, "numa_run_on_node");
+		ret = asprintf(&node_str, " on node %d", numa_node);
+		if (ret < 0)
+			err(EXIT_FAILURE, "numa_node, asprintf");
+	}
+
+	worker = numa_alloc_local(nthreads * sizeof(*worker));
 	if (!worker)
 		goto errmem;
 
 	if (!fshared)
-		futex_flag = FUTEX_PRIVATE_FLAG;
+		futex_flag = FUTEX_PRIVATE_FLAG | FUTEX_ATTACHED;
 
-	printf("Run summary [PID %d]: %d threads, each operating on %d [%s] futexes for %d secs.\n\n",
-	       getpid(), nthreads, nfutexes, fshared ? "shared":"private", nsecs);
+	printf("Run summary [PID %d]: %d threads%s, each operating on %d [%s] futexes for %d secs.\n\n",
+	       getpid(), nthreads,
+	       node_str ? : "",
+	       nfutexes, fshared ? "shared":"private",
+	       nsecs);
 
 	init_stats(&throughput_stats);
 	pthread_mutex_init(&thread_lock, NULL);
@@ -154,14 +221,39 @@ int bench_futex_hash(int argc, const char **argv,
 	threads_starting = nthreads;
 	pthread_attr_init(&thread_attr);
 	gettimeofday(&start, NULL);
-	for (i = 0; i < nthreads; i++) {
+	for (cpunum = 0, i = 0; i < nthreads; i++, cpunum++) {
+		unsigned int f_init;
+
+		do {
+			if (cpu_is_local(cpunum))
+				break;
+			cpunum++;
+			if (cpunum > ncpus)
+				cpunum = 0;
+		} while (1);
+
 		worker[i].tid = i;
-		worker[i].futex = calloc(nfutexes, sizeof(*worker[i].futex));
+		worker[i].futex = numa_alloc_local(nfutexes *
+						   sizeof(*worker[i].futex));
 		if (!worker[i].futex)
 			goto errmem;
+		worker[i].futex_id = numa_alloc_local(nfutexes *
+						   sizeof(*worker[i].futex_id));
+		if (!worker[i].futex_id)
+			goto errmem;
+
+		if (futex_flag & FUTEX_ATTACHED) {
+			for (f_init = 0; f_init < nfutexes; f_init++) {
+				ret = futex_attach(&worker[i].futex[f_init], futex_flag);
+				if (ret < 0)
+					err(EXIT_FAILURE, "Can't attached futex cpu%d futex%d",
+					    i, f_init);
+				worker[i].futex_id[f_init] = ret;
+			}
+		}
 
 		CPU_ZERO(&cpu);
-		CPU_SET(i % ncpus, &cpu);
+		CPU_SET(cpunum % ncpus, &cpu);
 
 		ret = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set_t), &cpu);
 		if (ret)
@@ -208,12 +300,12 @@ int bench_futex_hash(int argc, const char **argv,
 				       &worker[i].futex[nfutexes-1], t);
 		}
 
-		free(worker[i].futex);
+		numa_free(worker[i].futex, nfutexes * sizeof(*worker[i].futex));
 	}
 
 	print_summary();
 
-	free(worker);
+	numa_free(worker, nthreads * sizeof(*worker));
 	return ret;
 errmem:
 	err(EXIT_FAILURE, "calloc");
