@@ -620,6 +620,8 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
 	mm_init_owner(mm, p);
 	mmu_notifier_mm_init(mm);
 	clear_tlb_flush_pending(mm);
+	futex_mm_hash_init(mm);
+
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
 	mm->pmd_huge_pte = NULL;
 #endif
@@ -712,6 +714,7 @@ static inline void __mmput(struct mm_struct *mm)
 	khugepaged_exit(mm); /* must run before exit_mmap */
 	exit_mmap(mm);
 	set_mm_exe_file(mm, NULL);
+	futex_mm_hash_exit(mm);
 	if (!list_empty(&mm->mmlist)) {
 		spin_lock(&mmlist_lock);
 		list_del(&mm->mmlist);
@@ -928,6 +931,7 @@ void mm_release(struct task_struct *tsk, struct mm_struct *mm)
 #endif
 	if (unlikely(!list_empty(&tsk->pi_state_list)))
 		exit_pi_state_list(tsk);
+	futex_rm_hb(tsk);
 #endif
 
 	uprobe_free_utask(tsk);
@@ -1568,6 +1572,10 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 		p->tgid = p->pid;
 	}
 
+	retval = futex_add_hb(p);
+	if (retval)
+		goto bad_fork_free_pid;
+
 	p->nr_dirtied = 0;
 	p->nr_dirtied_pause = 128 >> (PAGE_SHIFT - 10);
 	p->dirty_paused_when = 0;
@@ -1585,7 +1593,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 	 */
 	retval = cgroup_can_fork(p);
 	if (retval)
-		goto bad_fork_free_pid;
+		goto bad_fork_free_futex_hb;
 
 	/*
 	 * Make it visible to the rest of the system, but dont wake it up yet.
@@ -1676,6 +1684,8 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 
 bad_fork_cancel_cgroup:
 	cgroup_cancel_fork(p);
+bad_fork_free_futex_hb:
+	futex_rm_hb(p);
 bad_fork_free_pid:
 	threadgroup_change_end(current);
 	if (pid != &init_struct_pid)
