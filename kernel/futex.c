@@ -3337,6 +3337,45 @@ static void futex_populate_hash(unsigned int hash_bits)
 static inline void futex_populate_hash(unsigned int hash_bits) { }
 #endif
 
+/**
+ * futex_preallocate_hash - Preallocate the process private hash
+ * @slots:	Number of slots to allocate
+ *
+ * The function will allocate the process private hash with the number of
+ * requested slots. The number is rounded to the next power of two and may not
+ * exceed the current system limit.
+ *
+ * If the hash was already allocated by either an earlier call to
+ * futex_preallocate_hash() or an earlier futex op which allocated the cache
+ * on the fly, we return the size of the active hash.
+ *
+ * Returns::	Size of the hash, if 0 then the global hash is used.
+ */
+static int futex_preallocate_hash(unsigned int slots)
+{
+#ifdef CONFIG_FUTEX_PRIVATE_HASH
+	struct mm_struct *mm = current->mm;
+	struct futex_hash_bucket *hb;
+	unsigned int bits;
+
+	/* Try to allocate the requested nr of slots */
+	bits = order_base_2(slots);
+
+	if (bits < FUTEX_MIN_HASH_BITS)
+		bits = FUTEX_MIN_HASH_BITS;
+
+	if (bits > futex_max_hash_bits)
+		bits = futex_max_hash_bits;
+
+	futex_populate_hash(bits);
+
+	hb = mm->futex_hash.hash;
+	return hb == FUTEX_USE_GLOBAL_HASH ? 0 : 1 << mm->futex_hash.hash_bits;
+#else
+	return 0;
+#endif
+}
+
 long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		u32 __user *uaddr2, u32 val2, u32 val3)
 {
@@ -3392,6 +3431,8 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 					     uaddr2);
 	case FUTEX_CMP_REQUEUE_PI:
 		return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
+	case FUTEX_PREALLOC_HASH:
+		return futex_preallocate_hash(val);
 	}
 	return -ENOSYS;
 }
