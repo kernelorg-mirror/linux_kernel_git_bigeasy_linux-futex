@@ -23,6 +23,9 @@
  *  Copyright (C) IBM Corporation, 2009
  *  Thanks to Thomas Gleixner for conceptual design and careful reviews.
  *
+ *  Private hashed futex support by Sebastian Siewior and Thomas Gleixner
+ *  Copyright (C) Linutronix GmbH, 2016
+ *
  *  Thanks to Ben LaHaise for yelling "hashed waitqueues" loudly
  *  enough at me, Linus for the original (flawed) idea, Matthew
  *  Kirkwood for proof-of-concept implementation.
@@ -65,6 +68,7 @@
 #include <linux/freezer.h>
 #include <linux/bootmem.h>
 #include <linux/fault-inject.h>
+#include <linux/rbtree.h>
 
 #include <asm/futex.h>
 
@@ -382,13 +386,13 @@ static inline int hb_waiters_pending(struct futex_hash_bucket *hb)
 }
 
 /**
- * hash_futex - Return the hash bucket in the global hash
+ * hash_global_futex - Return the hash bucket in the global hash
  * @key:	Pointer to the futex key for which the hash is calculated
  *
  * We hash on the keys returned from get_futex_key (see below) and return the
  * corresponding hash bucket in the global hash.
  */
-static struct futex_hash_bucket *hash_futex(union futex_key *key)
+static struct futex_hash_bucket *hash_global_futex(union futex_key *key)
 {
 	u32 hash = jhash2((u32*)&key->both.word,
 			  (sizeof(key->both.word)+sizeof(key->both.ptr))/4,
@@ -396,6 +400,144 @@ static struct futex_hash_bucket *hash_futex(union futex_key *key)
 	return &futex_queues[hash & (futex_hashsize - 1)];
 }
 
+#ifdef CONFIG_FUTEX_PRIVATE_HASH
+struct futex_hash_slot {
+	struct list_head	list;
+	struct rb_node		node;
+	unsigned long		uaddr;
+	unsigned int		user;
+	struct futex_hash_bucket hb;
+};
+
+struct futex_hash_slot *hash_tree_search(struct rb_root *root,
+					 unsigned long uaddr)
+{
+	struct rb_node *node = root->rb_node;
+
+	while (node) {
+		struct futex_hash_slot *fhs;
+
+		fhs = container_of(node, struct futex_hash_slot, node);
+		if (fhs->uaddr < uaddr)
+			node = node->rb_left;
+		else if (fhs->uaddr > uaddr)
+			node = node->rb_right;
+		else
+			return fhs;
+	}
+	return NULL;
+
+}
+
+static void hash_tree_add(struct rb_root *root, struct futex_hash_slot *fhs)
+{
+	struct rb_node **new = &(root->rb_node), *parent = NULL;
+
+	while (*new) {
+		struct futex_hash_slot *this;
+
+		this = container_of(*new, struct futex_hash_slot, node);
+
+		parent = *new;
+		if (this->uaddr < fhs->uaddr)
+			new = &((*new)->rb_left);
+		else if (this->uaddr > fhs->uaddr)
+			new = &((*new)->rb_right);
+		else
+			BUG();
+	}
+
+	/* Add new node and rebalance tree. */
+	rb_link_node(&fhs->node, parent, new);
+	rb_insert_color(&fhs->node, root);
+}
+
+static struct futex_hash_bucket *futex_hash_private_get_hb(union futex_key *key)
+{
+	struct futex_hash *fh;
+	struct futex_hash_slot *fhs;
+
+	fh = &current->mm->futex_hash;
+
+	raw_spin_lock(&fh->hash_lock);
+	/* Look for one that is already in use */
+
+	fhs = hash_tree_search(&fh->hash_tree, key->private.address);
+	if (fhs) {
+		fhs->user++;
+		raw_spin_unlock(&fh->hash_lock);
+		return &fhs->hb;
+	}
+
+	if (list_empty(&fh->empty_hb_list)) {
+		raw_spin_unlock(&fh->hash_lock);
+		BUG();
+	}
+	/* First user of the lock, grab fresh hb */
+	fhs = list_first_entry(&fh->empty_hb_list,
+			       struct futex_hash_slot, list);
+	list_del(&fhs->list);
+	fhs->user++;
+	fhs->uaddr = key->private.address;
+	hash_tree_add(&fh->hash_tree, fhs);
+	raw_spin_unlock(&fh->hash_lock);
+	return &fhs->hb;
+}
+
+static void futex_private_ret_hb(struct futex_hash_bucket *hb,
+				 union futex_key *key)
+{
+	struct futex_hash *fh;
+	struct futex_hash_slot *fhs;
+
+	if (key->both.offset & (FUT_OFF_INODE | FUT_OFF_MMSHARED))
+		return;
+
+	fh = &current->mm->futex_hash;
+	fhs = container_of(hb, struct futex_hash_slot, hb);
+
+	BUG_ON(!fhs->user);
+
+	raw_spin_lock(&fh->hash_lock);
+	fhs->user--;
+	/*
+	 * In the requeue phase we give the HB back (and return from the syscall
+	 * but we may not give it back because we have waiters here.
+	 */
+	if (fhs->user == 0 && atomic_read(&fhs->hb.waiters) == 0) {
+		rb_erase(&fhs->node, &fh->hash_tree);
+		list_add(&fhs->list, &fh->empty_hb_list);
+	}
+	raw_spin_unlock(&fh->hash_lock);
+}
+#else
+static inline void futex_private_ret_hb(static futex_hash_bucket *hb,
+					union futex_key *key)
+{
+}
+#endif
+
+/**
+ * hash_futex - Get the hash bucket for a futex
+ *
+ * Returns either the process private or the global hash bucket which fits the
+ * key.
+ */
+static struct futex_hash_bucket *hash_futex(union futex_key *key)
+{
+#ifdef CONFIG_FUTEX_PRIVATE_HASH
+	/*
+	 * Only private futexes use the per process hash and they will not have
+	 * FUT_OFF_INODE nor FUT_OFF_MMSHARED set.
+	 */
+	if (key->both.offset & (FUT_OFF_INODE | FUT_OFF_MMSHARED))
+		return hash_global_futex(key);
+
+	return futex_hash_private_get_hb(key);
+#else
+	return hash_global_futex(key);
+#endif
+}
 
 /**
  * match_futex - Check whether two futex keys are equal
@@ -526,7 +668,15 @@ get_futex_key(u32 __user *uaddr, int fshared, union futex_key *key, int rw)
 	 */
 	if (!fshared) {
 		key->private.mm = mm;
+		/*
+		 * If we have a process private hash, then we store uaddr
+		 * instead of the page base address.
+		 */
+#ifdef CONFIG_FUTEX_PRIVATE_HASH
+		key->private.address = (unsigned long) uaddr;
+#else
 		key->private.address = address;
+#endif
 		get_futex_key_refs(key);  /* implies smp_mb(); (B) */
 		return 0;
 	}
@@ -888,11 +1038,13 @@ void exit_pi_state_list(struct task_struct *curr)
 	 * versus waiters unqueueing themselves:
 	 */
 	raw_spin_lock_irq(&curr->pi_lock);
+	WARN_ON(!list_empty(head));
 	while (!list_empty(head)) {
 
 		next = head->next;
 		pi_state = list_entry(next, struct futex_pi_state, list);
 		key = pi_state->key;
+		/* XXX */
 		hb = hash_futex(&key);
 		raw_spin_unlock_irq(&curr->pi_lock);
 
@@ -1452,6 +1604,7 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	spin_unlock(&hb->lock);
 	wake_up_q(&wake_q);
 out_put_key:
+	futex_private_ret_hb(hb, &key);
 	put_futex_key(&key);
 out:
 	return ret;
@@ -1510,6 +1663,9 @@ retry_private:
 		if (!(flags & FLAGS_SHARED))
 			goto retry_private;
 
+		futex_private_ret_hb(hb1, &key1);
+		futex_private_ret_hb(hb2, &key2);
+
 		put_futex_key(&key2);
 		put_futex_key(&key1);
 		goto retry;
@@ -1547,6 +1703,8 @@ out_unlock:
 	double_unlock_hb(hb1, hb2);
 	wake_up_q(&wake_q);
 out_put_keys:
+	futex_private_ret_hb(hb1, &key1);
+	futex_private_ret_hb(hb2, &key2);
 	put_futex_key(&key2);
 out_put_key1:
 	put_futex_key(&key1);
@@ -1774,10 +1932,13 @@ retry_private:
 
 			ret = get_user(curval, uaddr1);
 			if (ret)
-				goto out_put_keys;
+				goto out_ret_hb;
 
 			if (!(flags & FLAGS_SHARED))
 				goto retry_private;
+
+			futex_private_ret_hb(hb1, &key1);
+			futex_private_ret_hb(hb2, &key2);
 
 			put_futex_key(&key2);
 			put_futex_key(&key1);
@@ -1836,6 +1997,9 @@ retry_private:
 		case -EFAULT:
 			double_unlock_hb(hb1, hb2);
 			hb_waiters_dec(hb2);
+
+			futex_private_ret_hb(hb1, &key1);
+			futex_private_ret_hb(hb2, &key2);
 			put_futex_key(&key2);
 			put_futex_key(&key1);
 			ret = fault_in_user_writeable(uaddr2);
@@ -1851,6 +2015,8 @@ retry_private:
 			 */
 			double_unlock_hb(hb1, hb2);
 			hb_waiters_dec(hb2);
+			futex_private_ret_hb(hb1, &key1);
+			futex_private_ret_hb(hb2, &key2);
 			put_futex_key(&key2);
 			put_futex_key(&key1);
 			cond_resched();
@@ -1967,6 +2133,9 @@ out_unlock:
 	while (--drop_count >= 0)
 		drop_futex_key_refs(&key1);
 
+out_ret_hb:
+	futex_private_ret_hb(hb1, &key1);
+	futex_private_ret_hb(hb2, &key2);
 out_put_keys:
 	put_futex_key(&key2);
 out_put_key1:
@@ -2051,7 +2220,7 @@ static inline void queue_me(struct futex_q *q, struct futex_hash_bucket *hb)
  *   1 - if the futex_q was still queued (and we removed unqueued it);
  *   0 - if the futex_q was already removed by the waking thread
  */
-static int unqueue_me(struct futex_q *q)
+static int unqueue_me(struct futex_q *q, struct futex_hash_bucket *hb)
 {
 	spinlock_t *lock_ptr;
 	int ret = 0;
@@ -2090,7 +2259,7 @@ retry:
 		spin_unlock(lock_ptr);
 		ret = 1;
 	}
-
+	futex_private_ret_hb(hb, &q->key);
 	drop_futex_key_refs(&q->key);
 	return ret;
 }
@@ -2376,6 +2545,7 @@ retry_private:
 
 	if (ret) {
 		queue_unlock(*hb);
+		futex_private_ret_hb(*hb, &q->key);
 
 		ret = get_user(uval, uaddr);
 		if (ret)
@@ -2390,6 +2560,7 @@ retry_private:
 
 	if (uval != val) {
 		queue_unlock(*hb);
+		futex_private_ret_hb(*hb, &q->key);
 		ret = -EWOULDBLOCK;
 	}
 
@@ -2438,7 +2609,7 @@ retry:
 	/* If we were woken (and unqueued), we succeeded, whatever. */
 	ret = 0;
 	/* unqueue_me() drops q.key ref */
-	if (!unqueue_me(&q))
+	if (!unqueue_me(&q, hb))
 		goto out;
 	ret = -ETIMEDOUT;
 	if (to && !to->task)
@@ -2547,6 +2718,7 @@ retry_private:
 			 * - The user space value changed.
 			 */
 			queue_unlock(hb);
+			futex_private_ret_hb(hb, &q.key);
 			put_futex_key(&q.key);
 			cond_resched();
 			goto retry;
@@ -2594,11 +2766,13 @@ retry_private:
 
 	/* Unqueue and drop the lock */
 	unqueue_me_pi(&q);
+	futex_private_ret_hb(hb, &q.key);
 
 	goto out_put_key;
 
 out_unlock_put_key:
 	queue_unlock(hb);
+	futex_private_ret_hb(hb, &q.key);
 
 out_put_key:
 	put_futex_key(&q.key);
@@ -2609,6 +2783,7 @@ out:
 
 uaddr_faulted:
 	queue_unlock(hb);
+	futex_private_ret_hb(hb, &q.key);
 
 	ret = fault_in_user_writeable(uaddr);
 	if (ret)
@@ -2676,6 +2851,7 @@ retry:
 		 */
 		if (ret == -EAGAIN) {
 			spin_unlock(&hb->lock);
+			futex_private_ret_hb(hb, &key);
 			put_futex_key(&key);
 			goto retry;
 		}
@@ -2704,11 +2880,13 @@ retry:
 out_unlock:
 	spin_unlock(&hb->lock);
 out_putkey:
+	futex_private_ret_hb(hb, &key);
 	put_futex_key(&key);
 	return ret;
 
 pi_faulted:
 	spin_unlock(&hb->lock);
+	futex_private_ret_hb(hb, &key);
 	put_futex_key(&key);
 
 	ret = fault_in_user_writeable(uaddr);
@@ -2951,6 +3129,7 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
 	}
 
 out_put_keys:
+	futex_private_ret_hb(hb, &q.key);
 	put_futex_key(&q.key);
 out_key2:
 	put_futex_key(&key2);
@@ -3181,6 +3360,104 @@ void exit_robust_list(struct task_struct *curr)
 		handle_futex_death((void __user *)pending + futex_offset,
 				   curr, pip);
 }
+
+#ifdef CONFIG_FUTEX_PRIVATE_HASH
+static void futex_init_fhs(struct futex_hash_slot *fhs)
+{
+	INIT_LIST_HEAD(&fhs->list);
+	atomic_set(&fhs->hb.waiters, 0);
+	plist_head_init(&fhs->hb.chain);
+	spin_lock_init(&fhs->hb.lock);
+}
+
+static int _futex_add_hb(struct mm_struct *mm)
+{
+	struct futex_hash_slot *fhs1;
+	struct futex_hash_slot *fhs2;
+	struct futex_hash *fh;
+	unsigned long flags;
+
+	/* Kernel threads won't need FUTEX support */
+	fh = &mm->futex_hash;
+
+	fhs1 = kzalloc_node(sizeof(struct futex_hash_slot), GFP_KERNEL,
+			    numa_node_id());
+	fhs2 = kzalloc_node(sizeof(struct futex_hash_slot), GFP_KERNEL,
+			    numa_node_id());
+	if (!fhs1 || !fhs2) {
+		kfree(fhs1);
+		kfree(fhs2);
+		return -ENOMEM;
+	}
+
+	futex_init_fhs(fhs1);
+	futex_init_fhs(fhs2);
+
+	raw_spin_lock_irqsave(&fh->hash_lock, flags);
+
+	list_add_tail(&fhs1->list, &fh->empty_hb_list);
+	list_add_tail(&fhs2->list, &fh->empty_hb_list);
+
+	raw_spin_unlock_irqrestore(&fh->hash_lock, flags);
+	return 0;
+}
+
+int futex_add_hb(struct task_struct *tsk)
+{
+	if (!tsk->mm)
+		return 0;
+	return _futex_add_hb(tsk->mm);
+}
+
+void futex_rm_hb(struct task_struct *tsk)
+{
+	struct futex_hash_slot *fhs1 = NULL;
+	struct futex_hash_slot *fhs2 = NULL;
+	struct futex_hash *fh;
+	unsigned long flags;
+
+	if (!tsk->mm)
+		return;
+	fh = &tsk->mm->futex_hash;
+
+	raw_spin_lock_irqsave(&fh->hash_lock, flags);
+	if (!list_empty(&fh->empty_hb_list)) {
+		fhs1 = list_last_entry(&fh->empty_hb_list,
+				       struct futex_hash_slot, list);
+		list_del(&fhs1->list);
+	}
+	if (!list_empty(&fh->empty_hb_list)) {
+		fhs2 = list_last_entry(&fh->empty_hb_list,
+				       struct futex_hash_slot, list);
+		list_del(&fhs2->list);
+	}
+
+	raw_spin_unlock_irqrestore(&fh->hash_lock, flags);
+	BUG_ON(!fhs1 || !fhs2);
+	BUG_ON(fhs1->user || fhs2->user);
+	kfree(fhs1);
+	kfree(fhs2);
+}
+
+void futex_mm_hash_init(struct mm_struct *mm)
+{
+	struct futex_hash *fh = &mm->futex_hash;
+
+	raw_spin_lock_init(&fh->hash_lock);
+	INIT_LIST_HEAD(&fh->empty_hb_list);
+	fh->hash_tree = RB_ROOT;
+	if (current->in_execve)
+		_futex_add_hb(mm);
+}
+
+void futex_mm_hash_exit(struct mm_struct *mm)
+{
+	struct futex_hash *fh = &mm->futex_hash;
+
+	BUG_ON(!list_empty(&fh->empty_hb_list));
+	BUG_ON(fh->hash_tree.rb_node);
+}
+#endif
 
 long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		u32 __user *uaddr2, u32 val2, u32 val3)
