@@ -35,6 +35,7 @@ static unsigned int nsecs    = 10;
 static unsigned int nfutexes = 1024;
 static bool fshared = false, done = false, silent = false;
 static int futex_flag = 0;
+static unsigned int prealloc;
 static int numa_node = -1;
 
 struct timeval start, end, runtime;
@@ -56,6 +57,7 @@ static const struct option options[] = {
 	OPT_UINTEGER('f', "futexes", &nfutexes, "Specify amount of futexes per threads"),
 	OPT_BOOLEAN( 's', "silent",  &silent,   "Silent mode: do not display data/details"),
 	OPT_BOOLEAN( 'S', "shared",  &fshared,  "Use shared futexes instead of private ones"),
+	OPT_UINTEGER('p', "prealloc",&prealloc, "Specify number of preallocated hash slots"),
 #ifdef CONFIG_NUMA
 	OPT_INTEGER( 'n', "numa",   &numa_node,  "Specify the NUMA node"),
 #endif
@@ -143,6 +145,7 @@ int bench_futex_hash(int argc, const char **argv,
 	unsigned int i, ncpus;
 	pthread_attr_t thread_attr;
 	struct worker *worker = NULL;
+	char *prealloc_str = NULL;
 	char *node_str = NULL;
 	unsigned int cpunum;
 
@@ -197,11 +200,20 @@ int bench_futex_hash(int argc, const char **argv,
 	if (!fshared)
 		futex_flag = FUTEX_PRIVATE_FLAG;
 
-	printf("Run summary [PID %d]: %d threads%s, each operating on %d [%s] futexes for %d secs.\n\n",
+	if (prealloc) {
+		ret = futex_preallocate(prealloc);
+		if (ret < 0)
+			err(EXIT_FAILURE, "futex_prealloate");
+		ret = asprintf(&prealloc_str, " P %u %d", prealloc, ret);
+		if (ret < 0)
+			err(EXIT_FAILURE, "futex_preallocate, asprintf");
+	}
+
+	printf("Run summary [PID %d]: %d threads%s, each operating on %d [%s%s] futexes for %d secs.\n\n",
 	       getpid(), nthreads,
 	       node_str ? : "",
 	       nfutexes, fshared ? "shared":"private",
-	       nsecs);
+	       prealloc_str ? : "", nsecs);
 
 	init_stats(&throughput_stats);
 	pthread_mutex_init(&thread_lock, NULL);

@@ -99,4 +99,11 @@ static inline int pthread_attr_setaffinity_np(pthread_attr_t *attr,
 }
 #endif
 
+#define FUTEX_PREALLOC_HASH  13
+
+static inline int futex_preallocate(u_int32_t hash_size)
+{
+	return futex(0, FUTEX_PREALLOC_HASH, hash_size, NULL, NULL, 0, 0);
+}
+
 #endif /* _FUTEX_H */
