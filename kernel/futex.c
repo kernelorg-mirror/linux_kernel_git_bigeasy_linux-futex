@@ -1114,6 +1114,15 @@ static int attach_to_pi_owner(u32 uval, union futex_key *key,
 		put_task_struct(p);
 		return -EPERM;
 	}
+	/*
+	 * If the futex is private then we need to verify that owner->mm is
+	 * the same as current->mm.
+	 */
+	if (!(key->both.offset & (FUT_OFF_INODE|FUT_OFF_MMSHARED)) &&
+	    p->mm != current->mm) {
+		put_task_struct(p);
+		return -EPERM;
+	}
 
 	/*
 	 * We need to look at the task state flags to figure out,
